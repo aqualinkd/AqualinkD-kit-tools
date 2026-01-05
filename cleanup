@@ -8,8 +8,14 @@
 RADXA_BOOT_CFG="/boot/extlinux/extlinux.conf"
 PI_BOOT_CFG="/boot/firmware/config.txt"
 
-RADXA_PATCH_URL="https://raw.githubusercontent.com/aqualinkd/AqualinkD-Radxa-zero3/refs/heads/main/patch-update"
-PI_PATCH_URL="https://raw.githubusercontent.com/aqualinkd/AqualinkD-Raspberry-CM/refs/heads/main/patch-update"
+#https://raw.githubusercontent.com/aqualinkd/AqualinkD-kit-tools/refs/heads/main/radxa-patch-update?token=XXXXXXXXXXXXXXX
+
+RADXA_PATCH_URL="https://raw.githubusercontent.com/aqualinkd/AqualinkD-kit-tools/refs/heads/main/radxa-patch-update"
+PI_PATCH_URL="https://raw.githubusercontent.com/aqualinkd/AqualinkD-kit-tools/refs/heads/main/raspberry-patch-update"
+
+LOCAL_URL="http://tiger/"
+RADXA_PATCH_URL="$LOCAL_URL/aqualinkd-kit-tools/radxa-patch-update"
+PI_PATCH_URL="$LOCAL_URL/aqualinkd-kit-tools/raspberry-patch-update"
 
 TRUE=0
 FALSE=1
@@ -94,12 +100,12 @@ check_raspiconfig_options() {
 
 check_rsetup_options() {
   if grep -q "external-antenna.dtbo" $RADXA_BOOT_CFG; then
-    echo "External Antenna is ENABLED!"
+    echo -e "External Antenna is ${GREEN}ENABLED!${NC}"
   else
-    echo "External Antenna is DISABLED!"
+    echo -e "External Antenna is ${RED}DISABLED!${NC}"
   fi
 
-  echo "Timezone is `cat /etc/timezone`"
+  echo -e "Timezone is ${GREEN}`cat /etc/timezone`${NC}"
 
   # Force tty since this is pipe from curl
   read -p 'Did you set Antenna & time correctly? (y/n) ' -n 1 -r < /dev/tty
@@ -121,7 +127,7 @@ check_wifi_visibility() {
     # 2. Use --colors yes to force color output even through the pipe
     # Use tee /dev/tty to show the colored output to the user immediately
     local wifi_list
-    wifi_list=$(sudo nmcli --colors yes -f SSID,BARS,SIGNAL device wifi list | tee /dev/tty)
+    wifi_list=$(sudo nmcli --colors yes -f SSID,MODE,CHAN,RATE,SIGNAL,BARS,SECURITY device wifi list | tee /dev/tty)
 
     # 3. Process the list for the count
     # Note: grep handles the color codes fine when looking for the header
