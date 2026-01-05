@@ -1,0 +1,561 @@
+#!/bin/bash
+#
+# Run from udev
+# /etc/udev/rules.d/71-auto-wifi-connect.rules
+# ACTION=="add", SUBSYSTEM=="block", ATTRS{removable}=="1", RUN+="/path/to/this/script.sh %k"
+#
+# Run once at startup
+# crontab entry
+# @reboot /path/to/this/script.sh
+#
+# Designed to look for any unmounted VFAT volumes, mount them and look for wpa_supplicant.conf or nmcli.conf file(s)
+# and setup wifi if found
+#
+# Newer systems with udev in it's own users space, will need to run a service so the mounts works
+# ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd?[0-9]", ATTRS{removable}=="1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="auto-wifi-mount@%k.service"
+#
+# create /etc/systemd/system/auto-wifi-mount@.service
+# [Unit]
+# Description=Auto WiFi Mount for %i
+# After=blockdev@dev-%i.target
+#
+# [Service]
+# Type=oneshot
+# # This ensures the script runs with full global permissions
+# ExecStart=/usr/local/bin/auto-wifi-connect %i
+# RemainAfterExit=no
+#
+# [Install]
+# WantedBy=multi-user.target
+#
+#
+
+VERSION="1.3"
+
+WPA_SOURCE_FNAME="wpa_supplicant.conf"
+WPA_ONETIME_FNAME="wpa_suplicant.temp.conf"
+
+NMC_SOURCE_FNAME="nmcli.conf"
+NMC_ONETIME_FNAME="nmcli.temp.conf"
+
+NMCONNECTION_FNAME="nmconnection.conf"
+
+WPA_FNAME="wpa_supplicant-wlan0"
+WPA_LOCATION="/etc/wpa_supplicant"
+NET_INTERFACE_FILE="/etc/network/interfaces.d/wlan0.conf"
+
+FULLSELF=$(readlink -f $0)
+SELF=$(basename "$0")
+SELFBN="${SELF%.*}"
+LOG="${SELFBN}.log"
+MOUNT="/tmp/${SELFBN}_mount"
+
+# Full path and script name to use for installation
+
+SERVICE="auto-wifi-connect"
+INSTALL_LOCATION="/usr/local/bin/${SERVICE}"
+SERVICE_PATH="/etc/systemd/system/${SERVICE}@.service"
+UDEV_RULE="/etc/udev/rules.d/71-${SERVICE}.rules"
+# Why I used 71 above.  AQD in ascii / 3.  (65+81+68) / 3 = 71.  Obviously can be any number
+
+OUTPUT="/tmp/$LOG" # This will get renamed.
+
+TRUE=0
+FALSE=1
+
+DEBUG=$FALSE
+
+# check root
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+fi
+
+log()
+{ 
+  logdebug "$*"
+  echo "$*"
+  echo "$*" | systemd-cat -t "$SELF" -p info  &>> "$OUTPUT"
+  echo "$*" 2>/dev/null >> "$OUTPUT"
+
+  #logdebug "$*"
+}
+
+logerr()
+{ 
+  logdebug "$*"
+  echo "Error: $*" >&2
+  echo "$*" | systemd-cat -t "$SELF" -p err &>> "$OUTPUT"
+  echo "ERROR: $*" 2>/dev/null >> "$OUTPUT"
+}
+
+logwarn()
+{ 
+  logdebug "$*"
+  echo "Warning: $*" >&2
+  echo "$*" | systemd-cat -t "$SELF" -p warning &>> "$OUTPUT"
+  echo "WARNING: $*" 2>/dev/null >> "$OUTPUT"
+}
+
+logdebug() {
+  if [ $DEBUG -eq $TRUE ]; then
+    echo "$*" >> "/tmp/${LOG}.debug"
+    echo "$*" | systemd-cat -t "$SELF" -p info
+  fi
+}
+
+function cleanup() {
+  # Check if mounted and unmount, blindly unmount and hide any errors
+  umount $MOUNT > /dev/null 2>&1
+  rmdir $MOUNT > /dev/null 2>&1
+}
+
+# This is how rsetup does it.
+function createWiFi_radxa() {
+   /usr/lib/rsetup/cli/wi-fi.sh
+
+   connect_wi-fi "$SSID" "$PASSWD"
+}
+
+
+# Should be valid for all options below
+#SSID="simplepass"
+#SSID="my password with spaces"
+#SSID='pa$$wordWith$Dollar'
+#SSID='pa"ss"wordWithQuotes'
+#SSID="pa'ss'wordWithSingleQuotes"
+
+function createWiFi_nmcli() {
+  local ssid="$1" 
+  local password="$2"
+  local total_retry=3 # Reduced as requested
+  local i IP
+
+  if [[ -z "$ssid" ]]; then
+    logerr "Usage: ${FUNCNAME[0]} [ssid] <password>"
+    return $FALSE
+  fi
+
+  nmcli radio wifi on
+  # Small sleep to let the radio "warm up" after turning it on
+  sleep 1
+
+  for ((i = 1; i <= total_retry; i++)); do
+    log "Attempt $i: Connecting to $ssid..."
+    
+    # Execute and capture
+    nmcli -w 15 device wifi connect "$ssid" password "$password" &>>"$OUTPUT"
+    res=$?
+
+    if [ $res -eq 0 ]; then
+      log "Wi-Fi successfully connected to $ssid."
+      # Capture IP address
+      IP=$(ip -4 addr show wlan0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+      log "IP Address = $IP"
+      return $TRUE
+    else
+      # Determine the reason based on the exit code
+      case $res in
+        3)  reason="Timeout (Signal might be too weak)" ;;
+        4)  reason="Connection failed (Wrong password or hardware issue)" ;;
+        7)  reason="Interface wlan0 not found" ;;
+        8)  reason="NetworkManager service is not running" ;;
+        10) reason="Permission denied (Need sudo)" ;;
+        *)  reason="Unknown error" ;;
+      esac
+
+      logwarn "Failed (Code: $res - $reason). Retry $i of $total_retry."
+      nmcli connection delete id "$ssid" &>/dev/null 
+      
+      sleep 2
+    fi
+  done
+
+  # --- ERROR HANDLING ---
+  logerr "Wi-Fi failed to connect after $total_retry retries."
+  
+  local dmarker=$(date +"%Y-%m-%d %H:%M:%S")
+  {
+    echo "=== Diagnostic Log: $dmarker ==="
+    nmcli general logging level TRACE domains WIFI,SUPPLICANT
+    nmcli -w 5 device wifi connect "$ssid" password "$password"
+    nmcli general logging level INFO domains DEFAULT
+    echo "=== NetworkManager Journal ==="
+    journalctl -u NetworkManager --since "$dmarker" --no-pager
+  } &>>"$OUTPUT"
+  
+  return $FALSE
+}
+
+function createWiFi_nmconnection() {
+  # nmcli but using a pre configured file.
+  # copt file to /etc/NetworkManager/system-connections/preconfigured.nmconnection
+  CONNFILE="/etc/NetworkManager/system-connections/preconfigured.nmconnection"
+
+  cp $MOUNT/$NMCONNECTION_FNAME $CONNFILE
+  
+  # NetworkManager will ignore nmconnection files with incorrect permissions,
+  # to prevent Wi-Fi credentials accidentally being world-readable.
+  chmod 600 ${CONNFILE}
+  
+  log "Brining up WiFi connection"
+  nmcli connection reload &>>"$OUTPUT"
+  nmcli connection up preconfigured &>>"$OUTPUT"
+
+  IP=$(ip -4 addr show wlan0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+  log "IP Address = $IP"
+}
+
+
+
+
+function createWiFi_WPA() {
+  
+  if [ "$1" == "temporary" ]; then
+    wpa_file="$MOUNT/$WPA_ONETIME_FNAME"
+    wpa_outfile="$MOUNT/$WPA_ONETIME_FNAME.log"
+  else
+    cp $MOUNT/$WPA_SOURCE_FNAME $WPA_LOCATION/$WPA_FNAME
+    if [ $? -ne 0 ]; then
+      logerr "Creation of '$WPA_LOCATION/$WPA_FNAME' failed."
+      exit 1
+    fi
+    cat << EOF > "$NET_INTERFACE_FILE"
+  auto wlan0
+   iface wlan0 inet dhcp
+   wpa-conf "$WPA_LOCATION/$WPA_FNAME"
+EOF
+    chmod 0600 "$WPA_LOCATION/$WPA_FNAME"
+    chmod 0600 "$NET_INTERFACE_FILE"
+
+    wpa_file="$WPA_LOCATION/$WPA_FNAME"
+    wpa_outfile="$MOUNT/$WPA_SOURCE_FNAME.log"
+  fi
+
+  #/usr/sbin/wpa_supplicant -B -i wlan0 -c $wpa_file > $&>> "$OUTPUT"
+  /usr/sbin/wpa_supplicant -Dnl80211 -i wlan0 -c$wpa_file > $OUTPUT 2>&1
+
+  if [ $? -ne 0 ] ; then
+    logerr "wpa_supplicant failed to create WiFi from $WPA_FNAME"
+    return $FALSE
+  fi
+
+  IP=$(ip -4 addr show wlan0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+  log "IP Address = $IP"
+  
+  return $TRUE
+}
+
+
+get_value_string() {
+  local file="$1"
+  local key="$2"
+
+  if [[ ! -f "$file" ]]; then
+    return 1
+  fi
+
+  # Find the line, ignore comments (#)
+  # Extract value after '='
+  # Strip surrounding ' or "
+  local raw_value
+  raw_value=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" | \
+              sed -e "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//" \
+                  -e "s/^['\"]//" -e "s/['\"]$//")
+
+  # Handle escapes: This turns \" into " and \$ into $
+  # If there are no escapes, it returns the string exactly as is.
+  printf '%b' "$raw_value"
+}
+
+function createWiFi() {
+  # Search mount for files.
+
+  if [[ -f "$MOUNT/$NMC_SOURCE_FNAME" ]]; then
+    logdebug "Using file $NMC_SOURCE_FNAME"
+    # Create NMCLI wifi
+    # This extract lines starting with SSID/PASSWORD, 
+    # then removes the ' ' or " " from the beginning and end.
+    SSID=$(get_value_string "$MOUNT/$NMC_SOURCE_FNAME" "SSID")
+    PASSWORD=$(get_value_string "$MOUNT/$NMC_SOURCE_FNAME" "PASSWORD")
+        
+    logdebug "Loaded SSID:$SSID  -  PASSWORD:$PASSWORD"
+
+    if [ -z "$SSID" ]; then
+      logerr "No SSID in $NMC_SOURCE_FNAME"
+      return $FALSE
+    fi
+    createWiFi_nmcli "$SSID" "$PASSWORD"
+  elif [ -f "$MOUNT/$NMCONNECTION_FNAME" ]; then
+    logdebug "Using file $NMCONNECTION_FNAME"
+    # Create wifi with .nmconnextion
+    createWiFi_nmconnection
+  elif [ -f "$MOUNT/$WPA_SOURCE_FNAME" ]; then
+    logdebug "Using file $WPA_SOURCE_FNAME"
+    # Create WPA wifi
+    createWiFi_WPA
+  else
+    # May not want to log this error, incase someone just inserts a card
+    logerr "No file $NMC_SOURCE_FNAME, $NMCONNECTION_FNAME or $WPA_SOURCE_FNAME on USB drive"
+  fi
+
+  return $TRUE
+}
+
+function mount_dev() {
+  local DEVICE="$1"
+  local MAX_RETRIES=3
+  local SLEEP_DELAY=2
+  local mounted=false
+
+  logdebug "Starting mount process for $DEVICE onto $MOUNT"
+
+  if [ -z "$DEVICE" ]; then
+    logerr "No device specified for mounting."
+    return $FALSE
+  fi
+
+  # --- Attempt Read-Write Mount Loop ---
+  for ((i=1; i<=MAX_RETRIES; i++)); do
+    logdebug "RW Mount Attempt $i of $MAX_RETRIES..."
+    
+    local cmd_output
+    cmd_output=$(mount "$DEVICE" -o rw,flush,utf8,X-mount.mkdir "$MOUNT" 2>&1)
+    
+    if [ $? -eq 0 ]; then
+      logdebug "Successfully mounted $DEVICE (RW)"
+      mounted=true
+      break
+    else
+      logwarn "Attempt $i failed: $cmd_output"
+      
+      # If the first attempt fails, run fsck before the second attempt
+      if [ $i -eq 1 ]; then
+        logwarn "First attempt failed. Running filesystem repair (fsck) on $DEVICE..."
+        /usr/sbin/fsck -a "$DEVICE" > /dev/null 2>&1
+      fi
+
+      [ $i -lt $MAX_RETRIES ] && sleep $SLEEP_DELAY
+    fi
+  done
+
+  # --- Fallback to Read-Only if RW failed ---
+  if [ "$mounted" = false ]; then
+    logwarn "All RW attempts failed. Attempting Read-Only fallback..."
+    cmd_output=$(mount "$DEVICE" -o ro,utf8,X-mount.mkdir "$MOUNT" 2>&1)
+    
+    if [ $? -eq 0 ]; then
+      logdebug "Successfully mounted $DEVICE (RO)"
+      mounted=true
+    else
+      logerr "Critical: RO mount also failed for $DEVICE. Error: $cmd_output"
+      return $FALSE
+    fi
+  fi
+
+  # --- Clean up old logs on the newly mounted drive ---
+  OUTPUT="$MOUNT/$LOG"
+  if [ -f "$OUTPUT" ]; then
+    rm "$OUTPUT" > /dev/null 2>&1
+  fi
+
+  return $TRUE
+}
+
+function unmount_dev() {
+
+  logdebug "UnMount $*"
+
+  if [ -z "$1" ]; then
+    return $FALSE
+  fi
+
+  umount $1
+  if [ $? -ne 0 ] ; then
+    logerr "Faied to unmount $1"
+    return $FALSE
+  fi
+
+  OUTPUT="/tmp/$LOG"
+
+  return $TRUE
+}
+
+# Below searches for unmounted devices starting with 's'  /dev/sda1 /dev/sda2 etc
+function search_device_to_mount() {
+  lsblk  --noheadings --raw \
+  | awk '$1~/s.*[[:digit:]]/ && $7=="" {print $1}' \
+  | xargs -I {} file -s /dev/{} \
+  | grep FAT \
+  | awk '{print $1}' \
+  | tr -d ':' \
+  | while IFS= read -r device
+  do 
+    if mount_dev $device; then
+      if createWiFi; then 
+        exit $TRUE
+      fi
+      umount_dev $MOUNT
+    fi
+  done
+
+  return $FALSE
+}
+
+function check_wifi() {
+  if ip a | grep wlan0 | grep -q inet; then
+    IP=$(ip -4 addr show wlan0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}')
+    logdebug "WiFi connected address $IP"
+    return $TRUE
+  else
+    logdebug "No WiFi connection"
+    return $FALSE
+  fi
+}
+
+
+
+
+create_run_mount_infrastructure() {
+
+  # Load the OS information, silence errors if file is missing
+  [ -f /etc/os-release ] && . /etc/os-release
+
+  # Use Parameter Expansion to set a default of 99 if VERSION_ID is empty/unset
+  # Also strip quotes in case the file contains VERSION_ID="12"
+  V_CHECK=$(echo "${VERSION_ID:-99}" | tr -d '"')
+
+  # Perform the check
+  # If file was missing or ID wasn't set, V_CHECK is 99, so it goes to 'else'
+  if [ "$V_CHECK" -le 11 ]; then
+    # Older release Bullseye or below, udev can run script directly
+    echo "Running on OS (Bullseye or older). Detected: ${VERSION_ID:-Unknown}"
+    log "Creating udev rule: $UDEV_RULE"
+    # Remove the quotes from EOF to allow variable expansion
+    tee "$UDEV_RULE" > /dev/null << EOF
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd?[0-9]", ATTRS{removable}=="1", RUN+="$INSTALL_LOCATION %k"
+EOF
+    #echo "ACTION==\"add\", SUBSYSTEM==\"block\", KERNEL==\"sd?[0-9]\", ATTRS{removable}==\"1\", RUN+=\"$INSTALL_LOCATION %k\"" > "$UDEV_RULE"
+    chmod 644 "$UDEV_RULE"
+    chown root:root "$UDEV_RULE"
+    udevadm control --reload-rules
+    log "Done! Plug in your USB drive to test."
+    return
+  fi
+
+  # Modern systems UDEV can't run script directly due to needing root, so create a service
+  # Create the Systemd Service Template
+  log "Creating service: $SERVICE_PATH"
+  tee "$SERVICE_PATH" > /dev/null << EOF
+[Unit]
+Description=Auto WiFi Mount for %i
+After=blockdev@dev-%i.target
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_LOCATION %i
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  log "Creating udev rule: $UDEV_RULE"
+  # Remove the quotes from EOF to allow variable expansion
+  tee "$UDEV_RULE" > /dev/null << EOF
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="sd?[0-9]", ATTRS{removable}=="1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="${SERVICE}@%k.service"
+EOF
+
+  # Set Permissions
+  chmod 644 "$SERVICE_PATH"
+  chmod 644 "$UDEV_RULE"
+
+  # Reload Daemons
+  log "Reloading systemd and udev..."
+  systemctl daemon-reload
+  udevadm control --reload-rules
+  #udevadm trigger
+
+  log "Done! Plug in your USB drive to test."
+}
+
+
+
+function printhelp() {
+  echo "$SELFBN version $VERSION"
+  echo "Usage $SELFBN <option>:-"
+  echo "      cron      --> when running from cron"
+  echo "      sdc1      --> look wifi config for files on sda1"
+  echo "      install   --> Install into udev rules"
+  echo "      uninstall --> uninstall from udev rules"
+  echo "      help      --> this"
+}
+
+
+###################################################################
+#
+#   MAIN
+#
+###################################################################
+
+
+
+logdebug "------ `date` ------"
+logdebug "$0 $@"
+
+if [[ $1 != "install" && $1 != "uninstall" ]]; then
+  if check_wifi; then
+    echo "Already have WiFi connection"
+    # May want to consider exit at this point
+  fi
+fi
+
+case $1 in
+  systemd|cron)
+    # We were started by systemd or cron.
+    logdebug "search all drives"
+    if ! search_device_to_mount; then cleanup; exit $FALSE; fi
+  ;;
+  sd*)
+    # started udev ie param $1 is disk sd1
+    logdebug "try mount /dev/$1"
+    if ! mount_dev /dev/$1; then cleanup; exit $FALSE; fi
+    logdebug "try create wifi"
+    if ! createWiFi; then cleanup; exit $FALSE; fi
+  ;;
+  install)
+    # install self
+    #/etc/udev/rules.d/98-usb-disk-mount.rules
+    if [[ $FULLSELF != $INSTALL_LOCATION ]]; then
+      log "Copy $FULLSELF to $INSTALL_LOCATION"
+      cp $FULLSELF $INSTALL_LOCATION
+    fi
+    create_run_mount_infrastructure
+    #echo "ACTION==\"add\", SUBSYSTEM==\"block\", KERNEL==\"sd?[0-9]\", ATTRS{removable}==\"1\", RUN+=\"$(readlink -f "$0") %k\"" > "$UDEV_RULE"
+    #echo "ACTION==\"add\", SUBSYSTEM==\"block\", KERNEL==\"sd?[0-9]\", ATTRS{removable}==\"1\", RUN+=\"$INSTALL_LOCATION %k\"" > "$UDEV_RULE"
+    #chmod 644 "$UDEV_RULE"
+    #chown root:root "$UDEV_RULE"
+  ;;
+  mount)
+    log "Using custom mount to test WiFi '$2'"
+    DEBUG=$TRUE
+    MOUNT=$2
+    createWiFi
+  ;;
+  uninstall)
+    # uninstall self
+    rm "$UDEV_RULE"
+  ;;
+  help)
+    printhelp
+    exit $TRUE
+  ;;
+  *)
+    printhelp
+    exit $TRUE
+  ;;
+esac
+
+cleanup
+
+logdebug "------ END ------"

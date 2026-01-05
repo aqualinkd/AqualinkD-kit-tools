@@ -1,0 +1,416 @@
+#!/bin/bash
+
+#  curl -fsSL https://raw.githubusercontent.com/aqualinkd/AqualinkD-Radxa-zero3/refs/heads/main/patch-update | sudo bash -s --
+#  curl -fsSL http://tiger/scratch/radxa/images/patch-update | sudo bash -s --
+
+# Can't use VERSION below since we source /etc/os-release and that has VERSION in it.
+SCRIPT_VERSION="1.0"
+
+SELF_NAME="patch-update"
+SELF_PRETTY_NAME="AqualinkD Radxa OS $SELF_NAME (v$SCRIPT_VERSION)"
+
+SELF_SRC="https://api.github.com/repos/AqualinkD/AqualinkD-Radxa-zero3/contents/$SELF_NAME"
+SELF_DLOAD="https://raw.githubusercontent.com/aqualinkd/AqualinkD-Radxa-zero3/refs/heads/main/$SELF_NAME"
+
+TRUE=0
+FALSE=1
+
+DEBUG=$TRUE
+
+# Check for new version of this script
+CHECK_NEW_VERSION=$TRUE
+
+# Regular services
+DISABLE_AIC8800_DEBUG=$TRUE
+DISABLE_AIC8800_SERIVCE=$TRUE
+DISABLE_HCIATTACH_SERIVCE=$TRUE
+DISABLE_BLUETOOTH_SERIVCE=$TRUE
+
+# User services
+DISABLE_BLUZ_SERIVCE=$TRUE
+
+# Other Options
+CHECK_SERIAL_BOOT_PARMS=$TRUE
+DISABLE_WIFI_POWERSAVE=$TRUE
+SET_WIFI_LOCALIZATION=$TRUE
+SET_JOURNAL_SIZE=$TRUE
+
+
+AIC8800_NODEBUG_FILE="/etc/modprobe.d/aic8800.conf"
+AIC8800_SERVICE_FILE="/etc/systemd/system/multi-user.target.wants/rsetup-aic8800-reset@ttyS1.service"
+HCIATTACH_SERVICE_FILE="/etc/systemd/system/multi-user.target.wants/rsetup-hciattach@ttyS1.service"
+BLUETOOTH_SERVICE_FILE="/etc/systemd/system/bluetooth.target.wants/bluetooth.service"
+
+
+# user or global services
+BLUZ_SERVICE_FILE="/etc/systemd/user/dbus-org.bluez.obex.service"
+#/etc/systemd/user/default.target.wants/pulseaudio.service
+#/etc/systemd/user/sockets.target.wants/pulseaudio.socket
+
+# Other files
+BOOT_CFG="/boot/extlinux/extlinux.conf"
+JOURNAL_CFG="/etc/systemd/journald.conf"
+WIFI_POWER_CFG="/etc/NetworkManager/conf.d/10-default-wifi-power-save.conf"
+
+_updated=$FALSE
+
+source /etc/os-release
+# Should give us the following
+# VERSION_ID="11"
+# VERSION="11 (bullseye)"
+# VERSION_CODENAME=bullseye
+
+
+red=$'\e[31m'
+green=$'\e[32m'
+reset=$'\e[0m'
+
+
+
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+fi
+
+#####################################
+# Functions
+
+# Nicely printed output 
+function msg() {
+  echo -e "${green}$@${reset}" >&2
+}
+function msgerr() {
+  echo -e "${red}Error: $@${reset}" >&2
+}
+
+# simple output 
+function log() {
+  echo -e "$*" >&2
+}
+function logdbg() {
+  if [ $DEBUG == $TRUE ]; then
+    log "$@"
+  fi
+}
+
+
+# Set patch per OS versions.
+set_paches_from_OS_version() {
+  source /etc/os-release
+
+  case $VERSION_ID in
+    11) 
+      # Linux 11 (bullseye)
+      DISABLE_AIC8800_DEBUG=$TRUE
+      DISABLE_AIC8800_SERIVCE=$TRUE
+      DISABLE_HCIATTACH_SERIVCE=$TRUE
+      DISABLE_BLUETOOTH_SERIVCE=$TRUE
+      DISABLE_BLUZ_SERIVCE=$TRUE
+      CHECK_SERIAL_BOOT_PARMS=$TRUE
+      DISABLE_WIFI_POWERSAVE=$TRUE
+      SET_JOURNAL_SIZE=$TRUE
+      SET_WIFI_LOCALIZATION=$TRUE
+    ;;
+    12)
+      # Linux 12 (bookwork)
+      DISABLE_AIC8800_DEBUG=$TRUE
+      DISABLE_AIC8800_SERIVCE=$TRUE
+      DISABLE_HCIATTACH_SERIVCE=$TRUE
+      DISABLE_BLUETOOTH_SERIVCE=$TRUE
+      DISABLE_BLUZ_SERIVCE=$TRUE
+      CHECK_SERIAL_BOOT_PARMS=$TRUE
+      DISABLE_WIFI_POWERSAVE=$TRUE
+      SET_JOURNAL_SIZE=$TRUE
+      SET_WIFI_LOCALIZATION=$TRUE
+    ;;
+    *)
+      msgerr "Unknown OS version '$VERSION_ID'"
+    ;;
+  esac
+}
+
+# Disable service $1 = service name
+disable_service() {
+  local service="$1"
+  msg "Disabeling $1"
+  sudo systemctl stop "$1"
+  sudo systemctl disable "$1"
+  _updated=$TRUE
+}
+
+
+# Check boot parameters in /boot/extlinux/extlinux.conf
+# Prompt, Timeout & console=
+check_boot_params() {
+  local isGood=$TRUE
+  # TODO, if either of these tests fail, we should also check the source files.
+  # /etc/kernel/cmdline
+  # /usr/share/u-boot-menu/conf.d/radxa.conf
+
+  # Make sure `prompt 0` and `timeout 0`
+  if ! grep -q "prompt 0" $BOOT_CFG; then
+    msgerr "Looks like $BOOT_CFG is bad '`cat $BOOT_CFG | grep prompt`' should be 'prompt 0'"
+    isGood=$FALSE
+    replace_in_file "`cat $BOOT_CFG | grep prompt`" "prompt 0" "$BOOT_CFG"
+    msg "   Changed to 'prompt 0'\n"
+  fi
+
+  if ! grep -q "timeout 0" $BOOT_CFG; then
+    msgerr "Looks like $BOOT_CFG is bad '`cat $BOOT_CFG | grep timeout`' should be 'timeout 0'"
+    isGood=$FALSE
+    replace_in_file "`cat $BOOT_CFG | grep timeout`" "timeout 0" "$BOOT_CFG"
+    msg "   Changed to 'timeout 0'\n"
+  fi
+
+  # Make sure `console=ttyFIQ0,1500000n8` does not exist
+  if grep -q "console=ttyFIQ0,1500000n8" $BOOT_CFG; then
+    msgerr "Looks like $BOOT_CFG is bad 'console=ttyFIQ0,1500000n8' should not exist in line \n'`cat $BOOT_CFG | grep "console=ttyFIQ0,1500000n8" `'"
+    isGood=$FALSE
+    replace_in_file "console=ttyFIQ0,1500000n8" " " "$BOOT_CFG"
+    msg "   Removed 'console=ttyFIQ0,1500000n8'\n"
+  fi
+
+  if [ $isGood == $TRUE ]; then
+    logdbg "Boot parameters look good - $BOOT_CFG"
+  else
+    _updated=$TRUE
+  fi
+}
+
+# Set max file size journal logs can use
+set_journal_size() {
+  if ! grep -q "^SystemMaxUse=200M" $JOURNAL_CFG; then
+    msg "Setting max journal to 200M"
+    echo "SystemMaxUse=200M" >> $JOURNAL_CFG
+    _updated=$TRUE
+  else
+    logdbg "Journal max size looks good $JOURNAL_CFG"
+  fi
+}
+
+check_wifi_localization()
+{
+  #logdbg "Check WiFi localization"
+
+  if iw reg get | grep -q "country US"; then
+    logdbg "WiFi localization set to US"
+    return
+  fi
+  
+  msg "WiFi localization is not set to US"
+  
+  if dpkg -l | grep -q crda; then
+    logdbg "crda is already installed"
+  else
+    msg "installing crda"
+    apt-get install crda --assume-yes
+  fi
+
+  if [ ! -f "/etc/default/crda" ]; then
+    msg "Setting WiFi to US '/etc/default/crda'"
+    echo "REGDOMAIN=US" > /etc/default/crda
+  else
+    if ! grep -q "^REGDOMAIN=US" /etc/default/crda ; then
+      msg "Setting WiFi to US '/etc/default/crda'"
+      echo "REGDOMAIN=US" >> /etc/default/crda
+    else
+      logdbg "/etc/default/crda is set to US"
+    fi
+  fi
+
+  #echo "options cfg80211 ieee80211_regdom=US" >> 
+    
+#  global
+#  country US: DFS-FCC
+#        (902 - 904 @ 2), (N/A, 30), (N/A)
+#        (904 - 920 @ 16), (N/A, 30), (N/A)
+#  phy#0
+#  country 99: DFS-UNSET
+#        (2402 - 2482 @ 40), (6, 20), (N/A)
+#        (2474 - 2494 @ 20), (6, 20), (N/A)
+#
+######## VS Bad output ############
+#
+# country 00: DFS-UNSET
+#        (2402 - 2472 @ 40), (6, 20), (N/A)
+#phy#0 (self-managed)
+# country 00: DFS-UNSET
+#
+
+
+  # sudo iw reg get | grep country
+
+  # check and install sudo apt-get install crda
+  #    apt list --installed crda
+  # modify  /etc/default/crda
+  # REGDOMAIN=US
+
+  # POTENTIAL FOR /etc/modprobe.d/cfg80211.conf having below in file
+  # options cfg80211 ieee80211_regdom=US
+
+}
+
+# turn off wifi powersaving
+disable_wifi_powersave()
+{
+  if [ ! -f "$WIFI_POWER_CFG" ]; then
+    msg "Turning off WiFi power saving"
+    cat << EOF > "$WIFI_POWER_CFG"
+# Turn off WiFi power saving
+[connection]
+wifi.powersave = 2
+EOF
+    systemctl restart NetworkManager
+    _updated=$TRUE
+  else
+    setting=$(grep "wifi.powersave" "$WIFI_POWER_CFG" | awk 'BEGIN { FS="=" } { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2 }')
+    if [ ! $setting -eq 2 ]; then
+      msg "WiFi power save already exists"
+      msg "Please edit '$WIFI_POWER_CFG' and change 'wifi.powersave = $setting' to 'wifi.powersave = 2'"
+    else
+      logdbg "WiFi power save is set correctly - $WIFI_POWER_CFG"
+    fi
+  fi
+
+  #sudo systemctl restart NetworkManager
+  #sudo iw dev wlan0 get power_save
+}
+
+# Check we are the latest version against github
+check_script_version() {
+ local latest_version=$(curl -fsSL -H "Accept: application/vnd.github.raw" "$SELF_SRC" 2>/dev/null | grep -m 1 SCRIPT_VERSION | awk -F'"' '{print $2}')
+
+  if [ -n "$latest_version" ]; then
+    if (( $(echo "$latest_version > $SCRIPT_VERSION" | bc -l) )); then
+      msg "New Version of this script exists, latest=$latest_version, current=$SCRIPT_VERSION"
+      log "Please use the following to download & install :-"
+      log "   curl -fsSL -H $SELF_DLOAD -o $0"
+      log ""
+      read -rep 'Do you want to continue? (y/n) ' -n 1
+      if [[ $REPLY =~ ^[Nn]$ ]]; then
+        exit $TRUE
+      fi
+    fi
+  fi
+}
+
+# Replace a string in a file. ONLY 1 time.
+replace_in_file() {
+  search=$1
+  replace=$2
+  file=$3
+
+  sed -i.orig "0,/${search}/s/${search}/${replace}/" $file
+}
+
+
+# Set apt for RadxaOS VENDOR stuff.
+_set_apt_test_() {
+  # This is probably not needed at the moment, since it's vendor
+  VENDOR="$(tr $"\0" $"\n" < /proc/device-tree/compatible | tail -n 1 | cut -d "," -f 1)"
+  source /etc/os-release
+  echo "deb [signed-by=/usr/share/keyrings/radxa-archive-keyring.gpg]" \
+     "https://radxa-repo.github.io/$VERSION_CODENAME $VENDOR-$VERSION_CODENAME main" | \
+     sudo tee "/etc/apt/sources.list.d/radxa-$VENDOR.list"
+  sudo apt-get update
+}
+
+# Below is a DIRECT copy from /usr/lib/rsetup/cli/system.sh
+# Simply here for context, not being used
+system_update() {
+    echo -e "\n======================="
+    if ! apt-get update
+    then
+        echo "Unable to update package list."
+        return 1
+    fi
+    if ! apt-get dist-upgrade --allow-downgrades
+    then
+        echo "Unable to upgrade packages."
+        return 2
+    fi
+    if ! apt-get dist-upgrade --allow-downgrades
+    then
+        echo "Unable to upgrade pinned packages."
+        return 3
+    fi
+}
+
+
+#####################################
+# Main
+
+log "-----------------------------------------------------------------------"
+msg "$SELF_PRETTY_NAME, $PRETTY_NAME"
+
+set_paches_from_OS_version
+
+if [ $CHECK_NEW_VERSION == $TRUE ]; then
+  check_script_version
+fi
+
+if [ $CHECK_SERIAL_BOOT_PARMS == $TRUE ]; then
+  check_boot_params
+fi
+
+if [ $SET_JOURNAL_SIZE == $TRUE ]; then
+  set_journal_size
+fi
+
+if [ $DISABLE_WIFI_POWERSAVE == $TRUE ]; then
+  disable_wifi_powersave
+fi
+
+if [ $SET_WIFI_LOCALIZATION == $TRUE ]; then
+  check_wifi_localization
+fi
+
+
+if [[ $DISABLE_AIC8800_DEBUG == $TRUE && ! -f "$AIC8800_NODEBUG_FILE" ]]; then
+  msg "Turning off debug messages for aic8800. $AIC8800_NODEBUG_FILE"
+  sudo touch "$AIC8800_NODEBUG_FILE"
+  echo "options aic8800_fdrv_sdio aicwf_dbg_level=0" >> "$AIC8800_NODEBUG_FILE"
+  echo "options aic_load_fw_sdio aicwf_dbg_level=0" >> "$AIC8800_NODEBUG_FILE"
+else
+  logdbg "AIC8800 debugging is disabled"
+fi
+
+
+if [[ $DISABLE_AIC8800_SERIVCE == $TRUE && -f "$AIC8800_SERVICE_FILE" ]]; then
+  disable_service "$(basename "$AIC8800_SERVICE_FILE")"
+else
+  logdbg "$(basename "$AIC8800_SERVICE_FILE") is disabled"
+fi
+
+if [[ $DISABLE_HCIATTACH_SERIVCE == $TRUE && -f "$HCIATTACH_SERVICE_FILE" ]]; then
+  disable_service "$(basename "$HCIATTACH_SERVICE_FILE")"
+else
+  logdbg "$(basename "$HCIATTACH_SERVICE_FILE") is disabled"
+fi
+
+if [[ $DISABLE_BLUETOOTH_SERIVCE == $TRUE && -f "$BLUETOOTH_SERVICE_FILE" ]]; then
+  disable_service "$(basename "$BLUETOOTH_SERVICE_FILE")"
+else
+  logdbg "$(basename "$BLUETOOTH_SERVICE_FILE") is disabled"
+fi
+
+if [[ $DISABLE_BLUZ_SERIVCE == $TRUE && -f "$BLUZ_SERVICE_FILE" ]]; then
+  msg "disabeling dbus-org.bluez.obex.service"
+  sudo systemctl stop dbus-org.bluez.obex.service
+  sudo systemctl --global disable dbus-org.bluez.obex.service
+else
+  logdbg "$(basename "$BLUZ_SERVICE_FILE") is disabled"
+fi
+
+
+
+
+
+
+
+if [ $_updated == $TRUE ]; then
+  msg "System updated"
+else
+  msg "System looks good, nothing changed!"
+fi
+
