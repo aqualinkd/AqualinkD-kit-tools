@@ -47,37 +47,56 @@ else
   exit 1
 fi
 
-set_us_timezone() {
-  echo "Select a US Time Zone:"
-  echo "1) Eastern"
-  echo "2) Central"
-  echo "3) Mountain"
-  echo "4) Pacific"
-  echo "5) Alaska"
-  echo "6) Hawaii"
-  
-  read -rp "Enter choice [1-6]: " tz_choice
 
-  case $tz_choice in
-    1) zone="US/Eastern" ;;
-    2) zone="US/Central" ;;
-    3) zone="US/Mountain" ;;
-    4) zone="US/Pacific" ;;
-    5) zone="US/Alaska" ;;
-    6) zone="US/Hawaii" ;;
-    *) 
-      echo "Invalid selection. Timezone not changed."
-      return 1 
-      ;;
-  esac
-
-  msg "Setting timezone to $zone..."
-  if sudo timedatectl set-timezone "$zone"; then
-    echo "Timezone successfully set to $(timedatectl show --property=Timezone --value)."
-  else
-    echo "Error: Failed to set timezone."
-  fi
+get_timezone() {
+  #timedatectl show --value -p Timezone
+  echo "$(timedatectl show --value -p Timezone) - $(date +%Z)"
+  # Output: America/Chicago
 }
+
+check_us_timezone() {
+  echo -e "Timezone is ${GREEN}`get_timezone`${NC}"
+
+  # Force tty since this is pipe from curl
+  read -p 'Did you want to change time zone? (y/n) ' -n 1 -r < /dev/tty
+  echo ""
+  if [[ $REPLY =~ ^[Nn]$ ]]; then
+    return
+  fi
+  
+    local labels=("Eastern" "Central" "Mountain" "Pacific" "Alaska" "Hawaii")
+    local cities=("America/New_York" "America/Chicago" "America/Denver" \
+                  "America/Los_Angeles" "America/Anchorage" "Pacific/Honolulu")
+
+    echo "Select US Timezone:"
+    for i in "${!labels[@]}"; do
+        echo "$((i+1))) ${labels[$i]}"
+    done
+
+    # < /dev/tty ensures the input comes from the user's keyboard, 
+    # even if the script was piped into bash via curl.
+    if read -rn 1 -p "Choice (1-6): " choice < /dev/tty; then
+        echo "" # New line after choice
+        if [[ "$choice" =~ [1-6] ]]; then
+            local idx=$((choice - 1))
+            local target="${cities[$idx]}"
+            
+            echo "Updating to ${labels[$idx]} ($target)..."
+            sudo timedatectl set-timezone "$target"
+            
+            # Legacy sync for Debian 11/12
+            [ -f /etc/timezone ] && echo "$target" | sudo tee /etc/timezone > /dev/null
+            
+            # Clean output (no leading/trailing spaces)
+            timedatectl | grep "Time zone" | xargs
+        else
+            echo "Invalid selection."
+        fi
+    fi
+
+  check_us_timezone
+}
+
 
 check_raspiconfig_options() {
   if grep -q "^[[:space:]]*dtparam=ant2" $PI_BOOT_CFG; then
@@ -86,16 +105,14 @@ check_raspiconfig_options() {
     echo -e "External Antenna is ${RED}DISABLED!${NC}"
   fi
 
-  echo -e "Timezone is ${GREEN}`cat /etc/timezone`${NC}"
-
-  # Force tty since this is pipe from curl
-  read -p 'Did you set Antenna & time correctly? (y/n) ' -n 1 -r < /dev/tty
+  read -p 'Did you want to change Antenna type? (y/n) ' -n 1 -r < /dev/tty
+  echo ""
   if [[ $REPLY =~ ^[Nn]$ ]]; then
-    raspi-config
-    check_raspiconfig_options
-  else
-    echo ""
+    return
   fi
+  
+  raspi-config
+  check_raspiconfig_options
 }
 
 check_rsetup_options() {
@@ -105,31 +122,26 @@ check_rsetup_options() {
     echo -e "External Antenna is ${RED}DISABLED!${NC}"
   fi
 
-  echo -e "Timezone is ${GREEN}`cat /etc/timezone`${NC}"
-
-  # Force tty since this is pipe from curl
-  read -p 'Did you set Antenna & time correctly? (y/n) ' -n 1 -r < /dev/tty
+  read -p 'Did you want to change Antenna type? (y/n) ' -n 1 -r < /dev/tty
+  echo ""
   if [[ $REPLY =~ ^[Nn]$ ]]; then
-    rsetup
-    check_rsetup_options
-  else
-    echo ""
+    return
   fi
+  
+  check_rsetup_options
 }
 
 check_wifi_visibility() {
     echo "Scanning for Wi-Fi networks..."
     
-    # 1. Trigger rescan
+    # Trigger rescan
     sudo nmcli device wifi rescan 2>/dev/null
     sleep 2
 
-    # 2. Use --colors yes to force color output even through the pipe
-    # Use tee /dev/tty to show the colored output to the user immediately
     local wifi_list
     wifi_list=$(sudo nmcli --colors yes -f SSID,MODE,CHAN,RATE,SIGNAL,BARS,SECURITY device wifi list | tee /dev/tty)
 
-    # 3. Process the list for the count
+    # Process the list for the count
     # Note: grep handles the color codes fine when looking for the header
     local count
     count=$(echo "$wifi_list" | grep -v "SSID" | grep -v '^--' | grep -v '^$' | wc -l)
@@ -143,6 +155,67 @@ check_wifi_visibility() {
         return 1
     fi
 }
+
+check_mmc_space() {
+    local dev="/dev/mmcblk0"
+    local threshold_mb=100
+
+    if [ ! -b "$dev" ]; then
+        echo "Error: $dev not found."
+        return 1
+    fi
+
+    # parted -m lists free space in megabytes (MB)
+    # Filter for 'free' segments and extract the size
+    local free_mb
+    free_mb=$(sudo parted -m "$dev" unit MB print free | grep ":free;" | tail -n 1 | cut -d: -f4 | sed 's/MB//')
+
+    # Compare as integers (bc used for decimal handling if needed)
+    if [ -n "$free_mb" ] && (( ${free_mb%.*} >= threshold_mb )); then
+        echo -e "${RED}WARNING: Disk is NOT fully partitioned.${NC}"
+        echo -e "${free_mb}MB of unallocated space is available."
+        read -p 'Did you want to continue (y/n) ' -n 1 -r < /dev/tty
+        echo ""
+        if [[ $REPLY =~ ^[Nn]$ ]]; then
+          exit
+        fi
+    else
+        echo -e "Disk is fully partitioned (Unallocated space is ${GREEN}${free_mb}MB${NC})."
+    fi
+}
+
+
+clean_logs() {
+
+  read -p 'Did you want to purge logs (y/n) ' -n 1 -r < /dev/tty
+  echo ""
+  if [[ $REPLY =~ ^[Nn]$ ]]; then
+    return
+  fi
+
+  echo "Cleaning system and user journals..."
+  # Rotate and vacuum are sufficient; never rm -rf the journal directory while the service is running.
+  sudo journalctl --rotate --vacuum-time=1s
+  sudo journalctl --user --rotate --vacuum-time=1s
+
+  echo "Clearing system logs..."
+  # Clean traditional text logs without deleting the files themselves (preserves permissions)
+  sudo find /var/log -type f -regex ".*\.log\|.*\.gz\|.*.[0-9]" -exec tee {} </dev/null >/dev/null \;
+
+  echo "Purging shell histories..."
+  # Clear current session memory
+  history -c 
+  
+  # Truncate files (more effective than rm for active shell handles)
+  true > ~/.bash_history
+  [ -f /root/.bash_history ] && sudo sh -c "true > /root/.bash_history"
+  
+  # Optional: clear the current session's histfile immediately
+  export HISTSIZE=0
+  
+  echo "Done. Logs vacuumed and histories truncated."
+}
+
 
 ########################################################################
 #
@@ -171,6 +244,10 @@ else
     echo "No URL parameter provided."
 fi
 
+
+check_mmc_space
+
+# Check antenna
 if [[ "$_pi" -eq "$TRUE" ]]; then
     check_raspiconfig_options
 elif [[ "$_radxa" -eq "$TRUE" ]]; then
@@ -179,9 +256,12 @@ elif [[ "$_radxa" -eq "$TRUE" ]]; then
     # Generic Linux logic
 fi
 
+# Check time zone
+check_us_timezone
 
 
 read -p 'Do you want to run patch update? (y/n) ' -n 1 -r < /dev/tty
+echo ""
 if [[ $REPLY =~ ^[Yy]$ ]]; then
   if [[ "$_pi" -eq "$TRUE" ]]; then
     curl -fsSL $PI_PATCH_URL | sudo bash -s --
@@ -199,14 +279,10 @@ fi
 
 # If we reached here, it means it passed!
 
-sudo journalctl --flush --rotate --vacuum-time=1s
-sudo journalctl --user --flush --rotate --vacuum-time=1s
-sudo rm -rf /var/log/journal/*
-sudo rm /home/radxa/.bash_history 2> /dev/null
-sudo rm /root/.bash_history 2> /dev/null
-
+clean_logs
 
 read -rep 'Halt / Reboot system, or exit? (H/R/E)' -n 1 -r < /dev/tty
+echo ""
 if [[ $REPLY =~ ^[Hh]$ ]]; then
   echo "Halting system!"
   sudo halt

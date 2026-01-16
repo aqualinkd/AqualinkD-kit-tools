@@ -1,0 +1,32 @@
+#!/bin/bash
+
+
+#sudo ./rkdeveloptool db ./rk356x_spl_loader_ddr1056_v1.12.109_no_check_todly.bin
+#sudo ./rkdeveloptool wl 0 zero.img
+#sudo ./rkdeveloptool rd
+
+
+
+IMAGE="./zero.img"
+LOADER="./rk356x_spl_loader_ddr1056_v1.12.109_no_check_todly.bin"
+RKDEVTOOL="./rkdeveloptool"
+
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+fi
+
+
+if $RKDEVTOOL ld | grep -s Maskrom ; then
+  read -rep 'Did usb list correctly? (y/n) ' -n 1
+  if [[ $REPLY =~ ^[Nn]$ ]]; then
+    exit
+  fi
+else
+  echo "ERROR Did not find device"
+  exit
+fi
+
+sudo $RKDEVTOOL db $LOADER
+sudo $RKDEVTOOL wl 0 $IMAGE
+sudo $RKDEVTOOL rd

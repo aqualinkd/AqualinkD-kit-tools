@@ -1,0 +1,69 @@
+#!/bin/bash
+
+# Ensure script is run as root
+if [[ "$EUID" -ne 0 ]]; then
+    echo "Error: Please run with sudo."
+    exit 1
+fi
+
+IMAGE_PATH="$1"
+ACTION="$2"
+
+unmount_image() {
+    echo "Unmounting /mnt/p1, p2, p3..."
+    for i in {1..3}; do
+        if mountpoint -q "/mnt/p$i"; then
+            umount "/mnt/p$i" && echo "Unmounted /mnt/p$i"
+        fi
+    done
+
+    # Find and detach the loop device associated with the image
+    local loop_dev
+    loop_dev=$(losetup -j "$IMAGE_PATH" | cut -d: -f1)
+    if [[ -n "$loop_dev" ]]; then
+        losetup -d "$loop_dev" && echo "Detached $loop_dev"
+    else
+        echo "No loop device found for $IMAGE_PATH"
+    fi
+}
+
+mount_image() {
+    # 1. Setup loop device with partition scan
+    local loop_dev
+    loop_dev=$(losetup --show -f -P "$IMAGE_PATH")
+    
+    if [[ -z "$loop_dev" ]]; then
+        echo "Failed to create loop device."
+        exit 1
+    fi
+
+    echo "Image mapped to $loop_dev"
+
+    # 2. Iterate and mount p1, p2, p3
+    for i in {1..3}; do
+        local part="${loop_dev}p$i"
+        local mnt="/mnt/p$i"
+        
+        if [ -b "$part" ]; then
+            mkdir -p "$mnt"
+            mount "$part" "$mnt" && echo "Mounted $part -> $mnt"
+        else
+            echo "Partition $i not found in image. Skipping."
+        fi
+    done
+}
+
+# Logic switch
+case "$ACTION" in
+    unmount)
+        unmount_image
+        ;;
+    *)
+        if [[ -f "$IMAGE_PATH" ]]; then
+            mount_image
+        else
+            echo "Usage: sudo $0 [image_file] [mount|unmount]"
+            exit 1
+        fi
+        ;;
+esac

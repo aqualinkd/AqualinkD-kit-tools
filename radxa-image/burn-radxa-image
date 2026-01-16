@@ -1,0 +1,146 @@
+#!/bin/bash
+
+# This script depends on rkdeveloptool, make sure it's build first.
+# https://github.com/rockchip-linux/rkdeveloptool
+#
+
+
+
+# rkdeveloptool ld
+#
+# sudo rkdeveloptool db <loader>
+#
+# sudo rkdeveloptool wl 0 <image>
+
+
+# Radxa disk layout
+# Disk /dev/mmcblk0: 7.28 GiB, 7818182656 bytes, 15269888 sectors
+# Units: sectors of 1 * 512 = 512 bytes
+# Sector size (logical/physical): 512 bytes / 512 bytes
+# I/O size (minimum/optimal): 512 bytes / 512 bytes
+# Disklabel type: gpt
+# Disk identifier: 5ADEAF2F-8A06-416B-9031-E6D1E6038AE9
+#
+# Device          Start      End  Sectors  Size Type
+# /dev/mmcblk0p1  32768    65535    32768   16M Microsoft basic data
+# /dev/mmcblk0p2  65536   679935   614400  300M EFI System
+# /dev/mmcblk0p3 679936 15269854 14589919    7G EFI System
+
+
+
+
+BINARY_NAME="rkdeveloptool"
+
+IMAGE_NAME="radxa-aqualinkd-bullseye-arm64.img"
+LOADER="rk356x_spl_loader_ddr1056_v1.12.109_no_check_todly.bin"
+
+# OS-Specific Default Paths for the binary
+OSX_BIN_PATH="/Users/sf/radxa/rkdeveloptool/$BINARY_NAME"
+LINUX_BIN_PATH="/nas/data/Development/Raspberry/AqualinkD-kit-tools/usb-tools/rkdeveloptool/$BINARY_NAME"
+
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
+  exit 1
+fi
+
+
+
+###################################
+#
+# main
+#
+
+# Ensure the script is run as root
+if [ "$EUID" -ne 0 ]; then
+  echo "Error: Please run this script with sudo."
+  exit 1
+fi
+
+# --- ARGUMENT PARSING ---
+IMAGE_FILE="$IMAGE_NAME"
+SELECTED_BIN=""
+
+while getopts "i:b:" opt; do
+  case $opt in
+    i) IMAGE_FILE="$OPTARG" ;;
+    b) SELECTED_BIN="$OPTARG" ;;
+    *) echo "Usage: $0 [-i image_file] [-b binary]"; exit 1 ;;
+  esac
+done
+
+# --- BINARY RESOLUTION LOGIC ---
+if [[ -z "$SELECTED_BIN" ]]; then
+    # 1. Check if it's already in the user's PATH
+    if command -v "$BINARY_NAME" >/dev/null 2>&1; then
+        SELECTED_BIN=$(command -v "$BINARY_NAME")
+    else
+        # 2. Check OS and set default path
+        OS_TYPE=$(uname -s)
+        if [[ "$OS_TYPE" == "Darwin" ]]; then
+            SELECTED_BIN="$OSX_BIN_PATH"
+        else
+            # Default to Linux path for Linux or other Unix-like systems
+            SELECTED_BIN="$LINUX_BIN_PATH"
+        fi
+    fi
+fi
+
+
+
+# Get the directory of the current script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Resolve IMAGE_PATH based on your priority:
+if [[ ! -f "$IMAGE_FILE" ]]; then   
+  if [[ -f "./$IMAGE_FILE" ]]; then
+    #  Look in the Current Working Directory
+    IMAGE_FILE="./$IMAGE_FILE"
+  elif [[ -f "$SCRIPT_DIR/$IMAGE_FILE" ]]; then
+    # Look in the Directory where the script is located
+    IMAGE_FILE="$SCRIPT_DIR/$IMAGE_FILE"
+  else
+    echo "Error: Image file not found at $IMAGE_FILE"
+    exit
+  fi
+fi
+
+# Resolve LOADER based on your priority:
+if [[ ! -f "$LOADER" ]]; then   
+  if [[ -f "./$LOADER" ]]; then
+    #  Look in the Current Working Directory
+    LOADER="./$LOADER"
+  elif [[ -f "$SCRIPT_DIR/$LOADER" ]]; then
+    # Look in the Directory where the script is located
+    LOADER="$SCRIPT_DIR/$LOADER"
+  else
+    echo "Error: Image file not found at $LOADER"
+    exit
+  fi
+fi
+
+
+if [[ ! -x "$SELECTED_BIN" ]]; then
+    echo "Error: Binary not found or not executable at $SELECTED_BIN"
+    exit
+fi
+
+
+# --- VALIDATION ---
+echo "--- Configuration ---"
+echo "Image File  : $IMAGE_FILE"
+echo "Loader File : $LOADER"
+echo "Binary      : $SELECTED_BIN"
+
+
+if $SELECTED_BIN ld | grep -s Maskrom ; then
+  read -rep 'Did usb list correctly? (y/n) ' -n 1
+  if [[ $REPLY =~ ^[Nn]$ ]]; then
+    exit
+  fi
+else
+  echo "ERROR Did not find device"
+  exit
+fi
+
+sudo $SELECTED_BIN db $LOADER
+sudo $SELECTED_BIN wl 0 $IMAGE_FILE 

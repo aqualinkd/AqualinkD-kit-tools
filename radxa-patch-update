@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#  curl -fsSL https://raw.githubusercontent.com/aqualinkd/AqualinkD-Radxa-zero3/refs/heads/main/patch-update | sudo bash -s --
+#  curl -fsSL https://raw.githubusercontent.com/aqualinkd/AqualinkD-kit-tools/refs/heads/main/radxa-patch-update | sudo bash -s --
 #  curl -fsSL http://tiger/scratch/radxa/images/patch-update | sudo bash -s --
 
 # Can't use VERSION below since we source /etc/os-release and that has VERSION in it.
@@ -9,8 +9,8 @@ SCRIPT_VERSION="1.0"
 SELF_NAME="patch-update"
 SELF_PRETTY_NAME="AqualinkD Radxa OS $SELF_NAME (v$SCRIPT_VERSION)"
 
-SELF_SRC="https://api.github.com/repos/AqualinkD/AqualinkD-Radxa-zero3/contents/$SELF_NAME"
-SELF_DLOAD="https://raw.githubusercontent.com/aqualinkd/AqualinkD-Radxa-zero3/refs/heads/main/$SELF_NAME"
+SELF_SRC="https://api.github.com/repos/AqualinkD/AqualinkD-kit-tools/contents/$SELF_NAME"
+SELF_DLOAD="https://raw.githubusercontent.com/aqualinkd/AqualinkD-kit-tools/refs/heads/main/$SELF_NAME"
 
 TRUE=0
 FALSE=1
