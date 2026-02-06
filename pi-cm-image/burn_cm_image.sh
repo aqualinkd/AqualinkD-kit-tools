@@ -4,9 +4,6 @@
 # https://github.com/raspberrypi/usbboot
 
 
-
-#!/bin/bash
-
 # --- CONFIGURATION ---
 #IMAGE_NAME="/path/to/hardcoded/IMAGE_NAME.img"
 IMAGE_NAME="raspios-aqualinkd-trixie-arm64-lite.img"
@@ -18,7 +15,10 @@ OSX_BIN_PATH="/Users/sf/raspberry/usbboot/$BINARY_NAME"
 LINUX_BIN_PATH="/nas/data/Development/Raspberry/AqualinkD-kit-tools/usb-tools/usbboot/$BINARY_NAME"
 
 
-
+# Define colors
+GREEN='\e[32m'
+RED='\e[31m'
+NC='\e[0m' # No Color (Reset)
 
 
 # Function to detect the parent disk of the 'bootfs' volume
@@ -123,7 +123,7 @@ fi
 
 # --- VALIDATION ---
 echo "--- Configuration ---"
-echo "Image File: $IMAGE_FILE"
+echo -e "Image File: $GREEN $IMAGE_FILE ${NC}"
 echo "Binary:     $SELECTED_BIN"
 
 
@@ -163,7 +163,8 @@ if [ -z "$RPI_DISK" ]; then
   exit 1
 fi
 
-echo "SUCCESS: Detected Raspberry Pi at $RPI_DISK"
+printf "SUCCESS: Detected Raspberry Pi at ${GREEN}$RPI_DISK${NC}\n"
+ 
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
     # macOS/OSX Command

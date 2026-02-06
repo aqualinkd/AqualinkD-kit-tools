@@ -184,6 +184,14 @@ check_mmc_space() {
     fi
 }
 
+show_mem_disk() {
+  mem=$(free --giga | awk '/^Mem:/{printf " %sG",$2}')
+  disk=$(lsblk -do SIZE /dev/mmcblk0 | tail -n 1)
+
+  echo -e "Memory :${GREEN}${mem}${NC}"
+  echo -e "Disk   :${GREEN}${disk}${NC}"
+}
+
 
 clean_logs() {
 
@@ -240,11 +248,11 @@ if [[ -n "$CALLED_URL" ]]; then
     echo "This script was downloaded from: $CALLED_URL"
     RADXA_PATCH_URL="$CALLED_URL/aqualinkd-kit-tools/radxa-patch-update"
     PI_PATCH_URL="$CALLED_URL/aqualinkd-kit-tools/raspberry-patch-update"
-else
-    echo "No URL parameter provided."
+#else
+    #echo "No URL parameter provided."
 fi
 
-
+show_mem_disk
 check_mmc_space
 
 # Check antenna
