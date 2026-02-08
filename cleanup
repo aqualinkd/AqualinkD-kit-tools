@@ -185,7 +185,8 @@ check_mmc_space() {
 }
 
 show_mem_disk() {
-  mem=$(free --giga | awk '/^Mem:/{printf " %sG",$2}')
+  #mem=$(free --giga | awk '/^Mem:/{printf " %sG",$2}')
+  mem=$(free -h --si | awk '/^Mem:/{printf " %s",$2}')
   disk=$(lsblk -do SIZE /dev/mmcblk0 | tail -n 1)
 
   echo -e "Memory :${GREEN}${mem}${NC}"
