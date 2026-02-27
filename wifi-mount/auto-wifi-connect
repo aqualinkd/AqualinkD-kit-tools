@@ -30,7 +30,7 @@
 #
 #
 
-VERSION="1.3"
+VERSION="1.4"
 
 WPA_SOURCE_FNAME="wpa_supplicant.conf"
 WPA_ONETIME_FNAME="wpa_suplicant.temp.conf"
@@ -312,7 +312,7 @@ function mount_dev() {
 
   if [ -z "$DEVICE" ]; then
     logerr "No device specified for mounting."
-    return $FALSE
+    return "$FALSE"
   fi
 
   # --- Attempt Read-Write Mount Loop ---
@@ -320,18 +320,21 @@ function mount_dev() {
     logdebug "RW Mount Attempt $i of $MAX_RETRIES..."
     
     local cmd_output
-    cmd_output=$(mount "$DEVICE" -o rw,flush,utf8,X-mount.mkdir "$MOUNT" 2>&1)
+    # Changed utf8 to iocharset=utf8 for universal FAT/exFAT compatibility
+    cmd_output=$(mount "$DEVICE" "$MOUNT" -o rw,sync,iocharset=utf8,X-mount.mkdir 2>&1)
     
     if [ $? -eq 0 ]; then
       logdebug "Successfully mounted $DEVICE (RW)"
       mounted=true
+      OUTPUT="$MOUNT/$LOG"
       break
     else
       logwarn "Attempt $i failed: $cmd_output"
       
-      # If the first attempt fails, run fsck before the second attempt
+      # Run fsck before the next attempt
       if [ $i -eq 1 ]; then
         logwarn "First attempt failed. Running filesystem repair (fsck) on $DEVICE..."
+        # -a is 'auto-repair', -p is 'preen' (non-destructive)
         /usr/sbin/fsck -a "$DEVICE" > /dev/null 2>&1
       fi
 
@@ -342,24 +345,27 @@ function mount_dev() {
   # --- Fallback to Read-Only if RW failed ---
   if [ "$mounted" = false ]; then
     logwarn "All RW attempts failed. Attempting Read-Only fallback..."
-    cmd_output=$(mount "$DEVICE" -o ro,utf8,X-mount.mkdir "$MOUNT" 2>&1)
+    # Fallback uses generic options
+    cmd_output=$(mount "$DEVICE" "$MOUNT" -o ro,iocharset=utf8,X-mount.mkdir 2>&1)
     
     if [ $? -eq 0 ]; then
       logdebug "Successfully mounted $DEVICE (RO)"
+      # Redirect OUTPUT to RAM because the disk is RO
+      OUTPUT="/tmp/$LOG"
       mounted=true
     else
       logerr "Critical: RO mount also failed for $DEVICE. Error: $cmd_output"
-      return $FALSE
+      return "$FALSE"
     fi
   fi
 
-  # --- Clean up old logs on the newly mounted drive ---
-  OUTPUT="$MOUNT/$LOG"
-  if [ -f "$OUTPUT" ]; then
-    rm "$OUTPUT" > /dev/null 2>&1
+  # --- Clean up old logs (Only if writable) ---
+  # Use -w to explicitly check write permission before trying to rm
+  if [ -w "$OUTPUT" ]; then
+    rm -f "$OUTPUT" > /dev/null 2>&1
   fi
 
-  return $TRUE
+  return "$TRUE"
 }
 
 function unmount_dev() {

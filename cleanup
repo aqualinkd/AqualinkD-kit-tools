@@ -1,8 +1,11 @@
 #!/bin/bash
 
 #
-# curl -fsSL http://tiger/scratch/raspberry/cleanup | sudo bash -s --
-# curl -fsSL http://tiger/scratch/radxa/images/cleanup | sudo bash -s --
+# Example:
+# curl -fsSL http://tiger/aqualinkd-kit-tools/cleanup | sudo bash -s -- m=smtp.example.com:25 r=fred@bloggs.com
+# curl -fsSL https://raw.githubusercontent.com/aqualinkd/AqualinkD-kit-tools/refs/heads/main/cleanup | sudo bash -s --
+# curl -fsSL https://raw.githubusercontent.com/aqualinkd/AqualinkD-kit-tools/refs/heads/main/cleanup | sudo bash -s -- m=smtp.example.com:25 r=fred@bloggs.com s=sender@address.com
+
 
 
 RADXA_BOOT_CFG="/boot/extlinux/extlinux.conf"
@@ -36,14 +39,15 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-if grep -q "Raspberry Pi" /proc/device-tree/model 2>/dev/null; then
-  echo "This is a Raspberry Pi."
+_model=$(tr -d '\0' < /sys/firmware/devicetree/base/model 2>/dev/null || echo "Unknown")
+echo "$_model"
+
+if [[ "$_model" == *"Raspberry Pi"* ]]; then
   _pi=$TRUE
-elif grep -q "Radxa ZERO" /proc/device-tree/model 2>/dev/null; then
-  echo "This is a RADXA"
+elif [[ "$_model" == *"Radxa ZERO"* ]]; then
   _radxa=$TRUE
 else
-  echo "Unknown SBC"
+  echo "Unknown SBC: $_model"
   exit 1
 fi
 
@@ -185,12 +189,30 @@ check_mmc_space() {
 }
 
 show_mem_disk() {
-  #mem=$(free --giga | awk '/^Mem:/{printf " %sG",$2}')
-  mem=$(free -h --si | awk '/^Mem:/{printf " %s",$2}')
-  disk=$(lsblk -do SIZE /dev/mmcblk0 | tail -n 1)
+  local mem=$(free --mega | awk '/^Mem:/{printf "%.0fG", $2/1000}')
+  local disk=$(lsblk -bdno SIZE /dev/mmcblk0 | awk '{printf "%.0fG", $1/1000/1000/1000}')
 
-  echo -e "Memory :${GREEN}${mem}${NC}"
-  echo -e "Disk   :${GREEN}${disk}${NC}"
+  if [ "$1" == "raw" ]; then
+    echo -e "Memory: $mem\nDisk: $disk"
+  else
+    echo -e "Memory : ${GREEN}${mem}${NC}"
+    echo -e "Disk   : ${GREEN}${disk}${NC}"
+  fi
+}
+
+show_wifi_mac() {
+  for interface in /sys/class/net/*; do
+    if [ -d "$interface/wireless" ] || [ -d "$interface/phy80211" ]; then
+      local mac=$(cat "$interface/address")
+      if [ "$1" == "raw" ]; then
+        echo "MAC: $mac"
+      else
+        echo -e "MAC    : ${GREEN}${mac}${NC}"
+      fi
+      return 0
+    fi
+  done
+  return 1
 }
 
 
@@ -226,12 +248,108 @@ clean_logs() {
 }
 
 
+send_smtp_email() {
+  # Validate required CLI args (m= and r=)
+  if [[ -z "$SMTP_SERVER_ARG" || -z "$RECIPIENT_EMAIL_ARG" ]]; then
+    echo -e "${RED}ERROR:${NC} both SMTP server (m=server[:port]) and recipient (r=address) must be provided."
+    return 1
+  fi
+
+  local smtp_server="$SMTP_SERVER_ARG"
+  local smtp_port=25
+
+  # If smtp_server provided as host:port, split it
+  if [[ "$smtp_server" == *:* ]]; then
+    smtp_port="${smtp_server#*:}"
+    smtp_server="${smtp_server%%:*}"
+  fi
+
+  local recipient_email="$RECIPIENT_EMAIL_ARG"
+  # Sender address (bare) and header (with display name)
+  local sender_addr="${SENDER_ARG:-$recipient_email}"
+  local sender_header="AqualinkD kit setup <$sender_addr>"
+  local subject="System Report: $(hostname)"
+
+  # Check if SMTP server is reachable/resolvable before doing work
+  if ! getent hosts "$smtp_server" >/dev/null 2>&1; then
+    echo "Error: SMTP Server '$smtp_server' cannot be resolved (DNS failure)."
+    return 1
+  fi
+
+  local raw_stats=$(show_mem_disk raw)
+  local raw_mac=$(show_wifi_mac raw)
+  local raw_model=$(tr -d '\0' < /sys/firmware/devicetree/base/model 2>/dev/null || echo "Unknown Model")
+  local raw_tz=$(timedatectl show --value -p Timezone) - $(date +%Z)
+
+  case "$TRUE" in
+  "$_pi")
+    grep -q "^[[:space:]]*dtparam=ant2" "$PI_BOOT_CFG" && raw_antenna="External" || raw_antenna="Internal"
+    ;;
+  "$_radxa")
+    grep -q "external-antenna.dtbo" "$RADXA_BOOT_CFG" && raw_antenna="External" || raw_antenna="Internal"
+    ;;
+  *)
+    raw_antenna="Unknown"
+    ;;
+  esac
+
+  # Build the actual body string
+  local message=$(cat <<EOF
+System Report for $(hostname)
+Date: $(date)
+--------------------------------------
+Model:  $raw_model
+$raw_stats
+$raw_mac
+TZ: $raw_tz
+Antenna: $raw_antenna
+--------------------------------------
+EOF
+)
+
+  # Open Connection
+  if ! exec 3<>/dev/tcp/"$smtp_server"/"$smtp_port"; then
+    echo "Error: Could not connect to $smtp_server on port $smtp_port"
+    return 1
+  fi
+
+  # SMTP Helper
+  send() {
+    echo -ne "$1\r\n" >&3
+    sleep 0.5
+  }
+
+  # SMTP Handshake
+  send "HELO $(hostname)"
+  send "MAIL FROM: <$sender_addr>"
+  send "RCPT TO: <$recipient_email>"
+  send "DATA"
+  
+  # Headers
+  echo -ne "From: $sender_header\r\n" >&3
+  echo -ne "To: $recipient_email\r\n" >&3
+  echo -ne "Subject: $subject\r\n" >&3
+  echo -ne "Content-Type: text/plain; charset=UTF-8\r\n" >&3
+  echo -ne "\r\n" >&3 
+
+  # Send Body Content
+  echo -ne "$message\r\n" >&3
+  
+  send "."
+  send "QUIT"
+  exec 3>&-
+  echo "Email sent successfully to $recipient_email"
+}
+
 ########################################################################
 #
 #.  main
 #
 
 CALLED_URL=""
+SMTP_SERVER_ARG=""
+RECIPIENT_EMAIL_ARG=""
+SENDER_ARG=""
 
 # Loop through all arguments passed after the "--"
 for arg in "$@"; do
@@ -240,6 +358,18 @@ for arg in "$@"; do
       # Strip "url=" from the start of the string
       CALLED_URL="${arg#url=}"
       shift # Remove from processing
+      ;;
+    m=*)
+      SMTP_SERVER_ARG="${arg#m=}"
+      shift
+      ;;
+    s=*)
+      SENDER_ARG="${arg#s=}"
+      shift
+      ;;
+    r=*)
+      RECIPIENT_EMAIL_ARG="${arg#r=}"
+      shift
       ;;
   esac
 done
@@ -254,6 +384,7 @@ if [[ -n "$CALLED_URL" ]]; then
 fi
 
 show_mem_disk
+show_wifi_mac
 check_mmc_space
 
 # Check antenna
@@ -287,6 +418,15 @@ if ! check_wifi_visibility; then
 fi
 
 # If we reached here, it means it passed!
+
+# Only ask to send email when both short CLI params were provided
+if [[ -n "$SMTP_SERVER_ARG" && -n "$RECIPIENT_EMAIL_ARG" ]]; then
+  read -p 'Do you want to send system report email? (y/n) ' -n 1 -r < /dev/tty
+  echo ""
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    send_smtp_email
+  fi
+fi
 
 clean_logs
 
